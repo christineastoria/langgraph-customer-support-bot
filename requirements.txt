@@ -2,5 +2,4 @@ langgraph
 langchain-openai
 langchain-community
 scikit-learn
-langgraph-checkpoint-sqlite
 python-dotenv
