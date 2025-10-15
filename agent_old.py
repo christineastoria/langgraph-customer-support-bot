@@ -28,7 +28,6 @@ class State(TypedDict):
     is_authed: bool
     customer_id: Optional[int]
     decision: Optional[str]
-    resume_agent: Optional[str]   
 
 # ---------------- Database ----------------
 def get_engine_for_chinook_db():
@@ -225,7 +224,8 @@ system_prompt = """You are a supervisor who routes between agents:
 - For music: route 'music'
 - For customer/account tasks: route 'customer'"""
 
-
+def with_customer(msgs): return [SystemMessage(content=customer_prompt)] + msgs
+def with_song(msgs): return [SystemMessage(content=song_prompt)] + msgs
 def with_system(msgs): return [SystemMessage(content=system_prompt)] + msgs
 
 from pydantic import BaseModel, Field
@@ -235,18 +235,12 @@ class Router(BaseModel):
 
 router = model.with_structured_output(Router)
 
-def with_customer_fn(msgs): 
-    return [SystemMessage(content=customer_prompt)] + msgs
-
-def with_song_fn(msgs): 
-    return [SystemMessage(content=song_prompt)] + msgs
-
-customer_chain = RunnableLambda(with_customer_fn) | model.bind_tools([
-    get_customer_info, authenticate_customer, get_past_purchases
+customer_chain = with_customer | model.bind_tools([
+    get_customer_info, authenticate_customer, get_past_purchases  # ← added
 ])
 
-song_chain = RunnableLambda(with_song_fn) | model.bind_tools([
-    get_albums_by_artist, get_tracks_by_artist, check_for_songs, get_past_purchases
+song_chain = with_song | model.bind_tools([
+    get_albums_by_artist, get_tracks_by_artist, check_for_songs, get_past_purchases  # ← added
 ])
 
 
@@ -262,15 +256,11 @@ auth_required_tools = [get_customer_info,  get_past_purchases]
 
 def handle_tool_error(state) -> dict:
     error = state.get("error")
-    last = state.get("messages", [])[-1] if state.get("messages") else None
-    tool_calls = getattr(last, "tool_calls", []) or getattr(last, "additional_kwargs", {}).get("tool_calls", []) or []
-    if not tool_calls:
-        # No specific tool call to respond to—emit a generic ToolMessage for tracing
-        return {"messages": [ToolMessage(content=f"Error: {repr(error)}", tool_call_id="unknown")]}
+    tool_calls = state["messages"][-1].tool_calls
     return {
         "messages": [
             ToolMessage(
-                content=f"Error: {repr(error)}\nPlease fix your mistakes.",
+                content=f"Error: {repr(error)}\n please fix your mistakes.",
                 tool_call_id=tc["id"],
             )
             for tc in tool_calls
@@ -299,16 +289,10 @@ def create_scoped_tool_node(tools: list):
 
 # ---------------- Nodes ----------------
 def init_node(state: State):
-    return {
-        "messages": state.get("messages", []),
-        "is_authed": state.get("is_authed", False),
-        "customer_id": state.get("customer_id"),
-        "decision": None,
-        "resume_agent": None,            
-    }
+    return {"messages": state.get("messages", []), "is_authed": state.get("is_authed", False)}
 
 def supervisor_node(state: State):
-    decision = router.invoke([SystemMessage(content=system_prompt)] + state["messages"])
+    decision= router.invoke([SystemMessage(content=system_prompt)] + state["messages"])
     return {"decision": decision.step}
 
 def music_node(state: State):
@@ -331,8 +315,6 @@ def ensure_auth_node(state: State):
     last_ai_msg = next((m for m in reversed(history) if isinstance(m, AIMessage)), None)
     if not last_ai_msg:
         return {"messages": []}
-
-    requester = getattr(last_ai_msg, "name", None)
 
     # Identify whether the AI requested any protected tool (e.g., get_past_purchases).
     tool_calls = last_ai_msg.additional_kwargs.get("tool_calls", [])
@@ -395,53 +377,47 @@ def ensure_auth_node(state: State):
         "messages": [auth_gate_msg, auth_call_ai] + tool_outputs,
         "is_authed": auth_success,
         "customer_id": authed_customer_id,
-        "decision": None,
-        "resume_agent": requester if auth_success and requester in {"music", "customer"} else None,
     }
 
 
 # ---------------- Routing ----------------
-def route_from_supervisor(state: State):
-    # 1) resume requested agent (after auth)
-    resume = state.get("resume_agent")
-    if resume in {"music","customer"}:
-        state["resume_agent"] = None
-        return resume
-    # 2) consume supervisor decision once
-    decision = state.get("decision")
-    if decision in {"music","customer"}:
-        state["decision"] = None
-        return decision
-    # 3) default: stay here until a decision is produced (or first turn)
-    return "supervisor"
-
-def route_from_music(state: State):
-    last = state["messages"][-1]
-    if _is_tool_call(last):
-        tcs = last.additional_kwargs.get("tool_calls", [])
-        if any(tc["function"]["name"] in AUTH_REQUIRED_TOOLS for tc in tcs):
-            return "ensure_auth" if not state.get("is_authed", False) else "auth_required_tools"
-        return "public_tools"
-    return END
-
-def route_from_customer(state: State):
-    last = state["messages"][-1]
-    if _is_tool_call(last):
-        tcs = last.additional_kwargs.get("tool_calls", [])
-        if any(tc["function"]["name"] in AUTH_REQUIRED_TOOLS for tc in tcs):
-            return "ensure_auth" if not state.get("is_authed", False) else "auth_required_tools"
-        return "public_tools"
-    return END
-
-def route_from_tools(state: State):
-    """After any ToolMessage, return to the agent that asked for it, else supervisor."""
+def _route(state: State):
     msgs = state.get("messages", [])
-    prev_ai = next((m for m in reversed(msgs[:-1])
-                    if isinstance(m, AIMessage) and _is_tool_call(m)), None)
-    if prev_ai and prev_ai.name in {"music","customer"}:
-        return prev_ai.name
+    if not msgs: return "supervisor"
+    last = msgs[-1]
+    if isinstance(last, AIMessage):
+        if last.name == "supervisor":
+            if _is_tool_call(last):
+                tcs = last.additional_kwargs.get("tool_calls", [])
+                if tcs:
+                    try:
+                        choice = json.loads(tcs[0]["function"].get("arguments") or "{}").get("choice")
+                    except Exception:
+                        choice = None
+                    if choice in {"music", "customer"}:
+                        return choice
+                # If malformed, bounce back to supervisor to re-pick
+                return "supervisor"
+            return END
+        if last.name in {"customer", "music"}:
+            if _is_tool_call(last):
+                tcs = last.additional_kwargs.get("tool_calls", [])
+                if any(tc["function"]["name"] in AUTH_REQUIRED_TOOLS for tc in tcs):
+                    return "ensure_auth" if not state.get("is_authed", False) else "auth_required_tools"
+                return "public_tools"
+            return END #TODO should we loop back to supervisor instead? need to figure out when to end vs return to supervisor
+    if isinstance(last, ToolMessage):
+        #route back to the appropriate sub-agent based on the last sub-agent that made a tool call
+        prev_ai = next((m for m in reversed(msgs[:-1]) if isinstance(m, AIMessage)), None)
+        if prev_ai and prev_ai.name == "supervisor" and _is_tool_call(prev_ai):
+            tcs = prev_ai.additional_kwargs.get("tool_calls", [])
+            if tcs:
+                try:
+                    choice = json.loads(tcs[0]["function"].get("arguments")).get("choice")
+                except: choice = None
+                if choice in {"music", "customer"}: return choice 
+        return "supervisor"
     return "supervisor"
-
 
 
 
@@ -456,26 +432,24 @@ def create_graph():
     g.add_node("auth_required_tools", create_scoped_tool_node(auth_required_tools))
     g.add_node("ensure_auth", ensure_auth_node)
 
+    nodes = {
+        "supervisor": "supervisor",
+        "music": "music",
+        "customer": "customer",
+        "public_tools": "public_tools",
+        "auth_required_tools": "auth_required_tools",
+        "ensure_auth": "ensure_auth",
+        END: END,
+    }
+
     g.add_edge(START, "init")
     g.add_edge("init", "supervisor")
-    g.add_conditional_edges("supervisor", route_from_supervisor, {
-    "supervisor":"supervisor", "music":"music", "customer":"customer"
-    })
-    g.add_conditional_edges("music", route_from_music, {
-        END: END, "public_tools":"public_tools",
-        "ensure_auth":"ensure_auth", "auth_required_tools":"auth_required_tools"
-    })
-    g.add_conditional_edges("customer", route_from_customer, {
-        END: END, "public_tools":"public_tools",
-        "ensure_auth":"ensure_auth", "auth_required_tools":"auth_required_tools"
-    })
-    # After any tools finish, decide where to go:
-    g.add_conditional_edges("public_tools", route_from_tools,
-        {"music":"music","customer":"customer","supervisor":"supervisor"})
-    g.add_conditional_edges("auth_required_tools", route_from_tools,
-        {"music":"music","customer":"customer","supervisor":"supervisor"})
-    g.add_conditional_edges("ensure_auth", route_from_supervisor,  # will use resume/decision
-        {"supervisor":"supervisor","music":"music","customer":"customer"})
+    g.add_conditional_edges("supervisor", _route, nodes)
+    g.add_conditional_edges("music", _route, nodes)
+    g.add_conditional_edges("customer", _route, nodes)
+    g.add_edge("public_tools", "supervisor")
+    g.add_edge("auth_required_tools", "supervisor")
+    g.add_edge("ensure_auth", "supervisor")
     return g
 
 agent = create_graph().compile()

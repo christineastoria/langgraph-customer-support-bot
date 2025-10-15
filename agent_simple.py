@@ -17,18 +17,24 @@ from typing_extensions import Literal
 from contextvars import ContextVar
 from langgraph.prebuilt import tools_condition
 
+from langchain_anthropic import ChatAnthropic
+from langchain_community.tools.tavily_search import TavilySearchResults
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import Runnable, RunnableConfig
+from langgraph.checkpoint.memory import InMemorySaver
+
+
 # ---------------- Environment / Model ----------------
 load_dotenv()
 model = ChatOpenAI(temperature=0, streaming=True, model="gpt-4o")
 graph_state_ctx: ContextVar[dict] = ContextVar("graph_state_ctx", default={})
+
 
 # ---------------- State ----------------
 class State(TypedDict):
     messages: Annotated[list[AnyMessage], add_messages]
     is_authed: bool
     customer_id: Optional[int]
-    decision: Optional[str]
-    resume_agent: Optional[str]   
 
 # ---------------- Database ----------------
 def get_engine_for_chinook_db():
@@ -46,14 +52,43 @@ def get_engine_for_chinook_db():
 engine = get_engine_for_chinook_db()
 db = SQLDatabase(engine)
 
-# ---------------- Helpers ----------------
-def add_name(msg, name):
-    d = msg.model_dump()
-    d["name"] = name
-    return AIMessage(**d)
 
-def _is_tool_call(msg):
-    return hasattr(msg, "additional_kwargs") and "tool_calls" in msg.additional_kwargs
+
+# ---------------- Helpers ----------------
+
+
+def handle_tool_error(state) -> dict:
+    error = state.get("error")
+    tool_calls = state["messages"][-1].tool_calls
+    return {
+        "messages": [
+            ToolMessage(
+                content=f"Error: {repr(error)}\n please fix your mistakes.",
+                tool_call_id=tc["id"],
+            )
+            for tc in tool_calls
+        ]
+    }
+
+def create_tool_node_with_fallback(tools: list) -> dict:
+    return ToolNode(tools).with_fallbacks(
+        [RunnableLambda(handle_tool_error)], exception_key="error"
+    )
+
+def create_scoped_tool_node(tools: list):
+    base = ToolNode(tools).with_fallbacks(
+        [RunnableLambda(handle_tool_error)], exception_key="error"
+    )
+
+    def run_with_state(state):
+        token = graph_state_ctx.set(state)  
+        try:
+            return base.invoke(state)
+        finally:
+            graph_state_ctx.reset(token)
+
+    return RunnableLambda(run_with_state)
+
 
 def enforce_customer_scope(customer_id: Optional[int]) -> Optional[dict]:
     st = graph_state_ctx.get({})
@@ -184,6 +219,7 @@ def check_for_songs(song_title: str):
         include_columns=True
     )
 
+
 @tool
 def authenticate_customer(customer_id: int, email: str):
     """Authenticate: verify email matches record for given customer."""
@@ -206,118 +242,62 @@ def authenticate_customer(customer_id: int, email: str):
 
 AUTH_REQUIRED_TOOLS = {"get_customer_info", "get_past_purchases"}
 
-# ---------------- Prompts ----------------
-customer_prompt = """You help users access or update account data. 
-Do NOT ask for authentication directly; the system handles that automatically."""
-song_prompt = """You are the Music agent.
-
-Your goal: recommend music.
-
-Decision policy:
-- If the user explicitly asks for personalized recommendations OR agrees to them, call the protected tool `get_past_purchases` (the system will handle authentication). DO NOT ask for email or customer ID.
-- If the user does NOT ask for personalization (or declines), provide generic recommendations using public tools (`get_albums_by_artist`, `get_tracks_by_artist`, `check_for_songs`), or a brief clarifying question about taste (genres/artists/moods) if needed.
-- You may ask a single, quick opt-in question like: "Want personalized picks based on your past purchases?" If the user says yes, call `get_past_purchases`. If no, proceed generically.
-- If you are already authenticated and the `customer_id` is known, pass that `customer_id` when calling protected tools.
-- Never ask for authentication details (email, ID). The system will handle that."""
-
-#TODO: make this a prompt template with outputs required from a pydantic model
-system_prompt = """You are a supervisor who routes between agents:
-- For music: route 'music'
-- For customer/account tasks: route 'customer'"""
 
 
-def with_system(msgs): return [SystemMessage(content=system_prompt)] + msgs
 
-from pydantic import BaseModel, Field
-
-class Router(BaseModel):
-    step: Literal["music", "customer"] = Field(description="One of: music, customer")
-
-router = model.with_structured_output(Router)
-
-def with_customer_fn(msgs): 
-    return [SystemMessage(content=customer_prompt)] + msgs
-
-def with_song_fn(msgs): 
-    return [SystemMessage(content=song_prompt)] + msgs
-
-customer_chain = RunnableLambda(with_customer_fn) | model.bind_tools([
-    get_customer_info, authenticate_customer, get_past_purchases
-])
-
-song_chain = RunnableLambda(with_song_fn) | model.bind_tools([
-    get_albums_by_artist, get_tracks_by_artist, check_for_songs, get_past_purchases
-])
+# ---------------- Tools ----------------
 
 
-# ---------------- Tool wrappers ----------------
+class Assistant:
+    def __init__(self, runnable: Runnable):
+        self.runnable = runnable
 
-public_tools = [
-    get_albums_by_artist,
-    get_tracks_by_artist,
-    check_for_songs,
-    authenticate_customer,
+    def __call__(self, state: State, config: RunnableConfig):
+        while True:
+            configuration = config.get("configurable", {})
+            passenger_id = configuration.get("passenger_id", None)
+            state = {**state, "user_info": passenger_id}
+            result = self.runnable.invoke(state)
+            # If the LLM happens to return an empty response, we will re-prompt it
+            # for an actual response.
+            if not result.tool_calls and (
+                not result.content
+                or isinstance(result.content, list)
+                and not result.content[0].get("text")
+            ):
+                messages = state["messages"] + [("user", "Respond with a real output.")]
+                state = {**state, "messages": messages}
+            else:
+                break
+        return {"messages": result}
+
+# ---------------- Primary Assistant ----------------
+# This is the main assistant that handles user queries and delegates to tools as needed.
+llm = ChatOpenAI(model="gpt-4-turbo-preview")
+
+primary_assistant_prompt = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            "You are a helpful customer support assistant for a music store "
+            " Use the provided tools to search for customer, music recommendations, and other information to assist the user's queries. "
+            " When searching, be persistent. Expand your query bounds if the first search returns no results. "
+            " If a search comes up empty, expand your search before giving up."
+            " If you get an authorization error from using a tool, use authenticate_user tool to authenticate them first. If "
+            "they are already authenticated and you get an error, inform them that they do not have access to that data. "
+        ),
+        ("placeholder", "{messages}"),
+    ]
+)
+
+part_1_tools = [
+check_for_songs,
+get_tracks_by_artist,
+get_albums_by_artist,
+get_customer_info,
+get_past_purchases,
 ]
-auth_required_tools = [get_customer_info,  get_past_purchases]
-
-def handle_tool_error(state) -> dict:
-    error = state.get("error")
-    last = state.get("messages", [])[-1] if state.get("messages") else None
-    tool_calls = getattr(last, "tool_calls", []) or getattr(last, "additional_kwargs", {}).get("tool_calls", []) or []
-    if not tool_calls:
-        # No specific tool call to respond to—emit a generic ToolMessage for tracing
-        return {"messages": [ToolMessage(content=f"Error: {repr(error)}", tool_call_id="unknown")]}
-    return {
-        "messages": [
-            ToolMessage(
-                content=f"Error: {repr(error)}\nPlease fix your mistakes.",
-                tool_call_id=tc["id"],
-            )
-            for tc in tool_calls
-        ]
-    }
-
-def create_tool_node_with_fallback(tools: list) -> dict:
-    return ToolNode(tools).with_fallbacks(
-        [RunnableLambda(handle_tool_error)], exception_key="error"
-    )
-
-def create_scoped_tool_node(tools: list):
-    base = ToolNode(tools).with_fallbacks(
-        [RunnableLambda(handle_tool_error)], exception_key="error"
-    )
-
-    def run_with_state(state):
-        token = graph_state_ctx.set(state)  
-        try:
-            return base.invoke(state)
-        finally:
-            graph_state_ctx.reset(token)
-
-    return RunnableLambda(run_with_state)
-
-
-# ---------------- Nodes ----------------
-def init_node(state: State):
-    return {
-        "messages": state.get("messages", []),
-        "is_authed": state.get("is_authed", False),
-        "customer_id": state.get("customer_id"),
-        "decision": None,
-        "resume_agent": None,            
-    }
-
-def supervisor_node(state: State):
-    decision = router.invoke([SystemMessage(content=system_prompt)] + state["messages"])
-    return {"decision": decision.step}
-
-def music_node(state: State):
-    ai = song_chain.invoke(state["messages"])
-    return {"messages": [add_name(ai, "music")]}
-
-def customer_node(state: State):
-    ai = customer_chain.invoke(state["messages"])
-    return {"messages": [add_name(ai, "customer")]}
+part_1_assistant_runnable = primary_assistant_prompt | llm.bind_tools(part_1_tools)
 
 
 def ensure_auth_node(state: State):
@@ -331,8 +311,6 @@ def ensure_auth_node(state: State):
     last_ai_msg = next((m for m in reversed(history) if isinstance(m, AIMessage)), None)
     if not last_ai_msg:
         return {"messages": []}
-
-    requester = getattr(last_ai_msg, "name", None)
 
     # Identify whether the AI requested any protected tool (e.g., get_past_purchases).
     tool_calls = last_ai_msg.additional_kwargs.get("tool_calls", [])
@@ -395,87 +373,51 @@ def ensure_auth_node(state: State):
         "messages": [auth_gate_msg, auth_call_ai] + tool_outputs,
         "is_authed": auth_success,
         "customer_id": authed_customer_id,
-        "decision": None,
-        "resume_agent": requester if auth_success and requester in {"music", "customer"} else None,
     }
 
+# ---------------- Routers ----------------
 
-# ---------------- Routing ----------------
-def route_from_supervisor(state: State):
-    # 1) resume requested agent (after auth)
-    resume = state.get("resume_agent")
-    if resume in {"music","customer"}:
-        state["resume_agent"] = None
-        return resume
-    # 2) consume supervisor decision once
-    decision = state.get("decision")
-    if decision in {"music","customer"}:
-        state["decision"] = None
-        return decision
-    # 3) default: stay here until a decision is produced (or first turn)
-    return "supervisor"
-
-def route_from_music(state: State):
+def _after_tools_router(state: State):
     last = state["messages"][-1]
-    if _is_tool_call(last):
-        tcs = last.additional_kwargs.get("tool_calls", [])
-        if any(tc["function"]["name"] in AUTH_REQUIRED_TOOLS for tc in tcs):
-            return "ensure_auth" if not state.get("is_authed", False) else "auth_required_tools"
-        return "public_tools"
-    return END
-
-def route_from_customer(state: State):
-    last = state["messages"][-1]
-    if _is_tool_call(last):
-        tcs = last.additional_kwargs.get("tool_calls", [])
-        if any(tc["function"]["name"] in AUTH_REQUIRED_TOOLS for tc in tcs):
-            return "ensure_auth" if not state.get("is_authed", False) else "auth_required_tools"
-        return "public_tools"
-    return END
-
-def route_from_tools(state: State):
-    """After any ToolMessage, return to the agent that asked for it, else supervisor."""
-    msgs = state.get("messages", [])
-    prev_ai = next((m for m in reversed(msgs[:-1])
-                    if isinstance(m, AIMessage) and _is_tool_call(m)), None)
-    if prev_ai and prev_ai.name in {"music","customer"}:
-        return prev_ai.name
-    return "supervisor"
+    if isinstance(last, ToolMessage):
+        payload = last.content
+        if isinstance(payload, str):
+            try: payload = json.loads(payload)
+            except: payload = {}
+        if isinstance(payload, dict) and payload.get("error") == "AUTH_REQUIRED":
+            return "ensure_auth"
+    return "assistant"
 
 
-
-
-# ---------------- Graph ----------------
 def create_graph():
-    g = StateGraph(State)
-    g.add_node("init", init_node)
-    g.add_node("supervisor", supervisor_node)
-    g.add_node("music", music_node)
-    g.add_node("customer", customer_node)
-    g.add_node("public_tools", create_tool_node_with_fallback(public_tools))
-    g.add_node("auth_required_tools", create_scoped_tool_node(auth_required_tools))
-    g.add_node("ensure_auth", ensure_auth_node)
+    builder = StateGraph(State)
 
-    g.add_edge(START, "init")
-    g.add_edge("init", "supervisor")
-    g.add_conditional_edges("supervisor", route_from_supervisor, {
-    "supervisor":"supervisor", "music":"music", "customer":"customer"
-    })
-    g.add_conditional_edges("music", route_from_music, {
-        END: END, "public_tools":"public_tools",
-        "ensure_auth":"ensure_auth", "auth_required_tools":"auth_required_tools"
-    })
-    g.add_conditional_edges("customer", route_from_customer, {
-        END: END, "public_tools":"public_tools",
-        "ensure_auth":"ensure_auth", "auth_required_tools":"auth_required_tools"
-    })
-    # After any tools finish, decide where to go:
-    g.add_conditional_edges("public_tools", route_from_tools,
-        {"music":"music","customer":"customer","supervisor":"supervisor"})
-    g.add_conditional_edges("auth_required_tools", route_from_tools,
-        {"music":"music","customer":"customer","supervisor":"supervisor"})
-    g.add_conditional_edges("ensure_auth", route_from_supervisor,  # will use resume/decision
-        {"supervisor":"supervisor","music":"music","customer":"customer"})
-    return g
 
+    # Define nodes: these do the work
+    builder.add_node("assistant", Assistant(part_1_assistant_runnable))
+    builder.add_node("tools", create_scoped_tool_node(part_1_tools)) #for now all of them have scope but only protected ones need
+    builder.add_node("ensure_auth", ensure_auth_node)
+    # Define edges: these determine how the control flow moves
+    builder.add_edge(START, "assistant")
+    builder.add_conditional_edges(
+        "assistant",
+        tools_condition,
+    )
+
+    builder.add_edge("ensure_auth", "assistant")
+    # 3) Use a conditional edge FROM tools to read errors and route to ensure_auth if needed
+    builder.add_conditional_edges("tools", _after_tools_router, {
+        "ensure_auth": "ensure_auth",
+        "assistant": "assistant",
+    })
+
+
+    return builder
+
+# The checkpointer lets the graph persist its state
+# this is a complete memory for the entire graph.
+  
 agent = create_graph().compile()
+
+
+
