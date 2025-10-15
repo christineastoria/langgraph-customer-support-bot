@@ -17,6 +17,8 @@ from typing_extensions import Literal
 from contextvars import ContextVar
 from langgraph.prebuilt import tools_condition
 from langchain_core.messages import HumanMessage, SystemMessage, BaseMessage
+from datetime import datetime
+from typing import Optional, List, Dict, Any
 
 # ---------------- Environment / Model ----------------
 load_dotenv()
@@ -100,6 +102,7 @@ def focus_system_for(agent: str, state: State) -> SystemMessage:
         {"You are the **final** responder for this user turn." if is_final else "You are **not** the final responder for this turn; another agent will reply next."}
 
         CRITICAL RULES:
+        - Keep responses short to medium length and to the point.
         - Provide a concrete answer to the latest user message for your domain.
         - Do **not** use generic closers (e.g., "let me/us know if anything else...").
         - If tools are needed, call them; otherwise answer directly.
@@ -125,12 +128,11 @@ def get_customer_info(customer_id: int):
 @tool
 def get_past_purchases(
     customer_id: int,
-    limit: int = 25,
     recent_first: bool = True,
 ):
     """
     Protected: fetch a customer's past purchases (invoice-level + line items) with track/album/artist/genre.
-    Results are ordered by invoice date (desc by default) and limited.
+    Results are ordered by invoice date (desc by default).
     Returns: {"columns": [...], "rows": [[...], ...]}
     """
     scope_error = enforce_customer_scope(customer_id)
@@ -162,7 +164,7 @@ def get_past_purchases(
             LIMIT :lim
         """)
         with engine.connect() as conn:
-            rows = conn.execute(sql, {"cid": customer_id, "lim": limit}).fetchall()
+            rows = conn.execute(sql, {"cid": customer_id}).fetchall()
 
         # Normalize to {columns, rows} like db.run(..., include_columns=True)
         columns = [
@@ -217,37 +219,6 @@ def check_for_songs(song_title: str):
     )
 
 @tool
-def get_top_genres_for_customer(customer_id: int, limit: int = 5):
-    """
-    Protected: Return the customer's most-purchased genres ranked by total quantity,
-    with tie-breakers on distinct tracks purchased.
-    Returns: {"columns": [...], "rows": [[...], ...]}
-    """
-    scope_error = enforce_customer_scope(customer_id)
-    if scope_error:
-        return scope_error
-
-    sql = text("""
-        SELECT
-            g.GenreId,
-            g.Name AS Genre,
-            SUM(il.Quantity) AS TotalQuantity,
-            COUNT(DISTINCT il.TrackId) AS DistinctTracks
-        FROM Invoice i
-        JOIN InvoiceLine il ON il.InvoiceId = i.InvoiceId
-        JOIN Track t ON t.TrackId = il.TrackId
-        LEFT JOIN Genre g ON g.GenreId = t.GenreId
-        WHERE i.CustomerId = :cid
-        GROUP BY g.GenreId, g.Name
-        ORDER BY TotalQuantity DESC, DistinctTracks DESC, g.Name ASC
-        LIMIT :lim
-    """)
-    with engine.connect() as conn:
-        rows = conn.execute(sql, {"cid": customer_id, "lim": limit}).fetchall()
-    columns = ["GenreId", "Genre", "TotalQuantity", "DistinctTracks"]
-    return {"columns": columns, "rows": [list(r) for r in rows]}
-
-@tool
 def authenticate_customer(customer_id: int, email: str):
     """Authenticate: verify email matches record for given customer."""
     try:
@@ -266,8 +237,234 @@ def authenticate_customer(customer_id: int, email: str):
         return {"success": False, "customer_id": None, "message": "Email does not match records."}
     except Exception as e:
         return {"success": False, "customer_id": None, "message": f"Auth error: {e}"}
+    
+def get_state():
+    return graph_state_ctx.get({})
 
-AUTH_REQUIRED_TOOLS = {"get_customer_info", "get_past_purchases"}
+def resolve_track_ids(conn, kind: str, item: str) -> List[int]:
+    """
+    Resolve user intent to TrackId list.
+    kind: "track" | "song" | "album"
+    item: can be id or name/title
+    """
+    kind = (kind or "track").lower()
+    # numeric id shortcut
+    def _is_int(s):
+        try: int(s); return True
+        except: return False
+
+    if kind in {"track", "song"}:
+        if _is_int(item):
+            # validate track id exists
+            row = conn.execute(text("SELECT TrackId FROM Track WHERE TrackId=:tid"), {"tid": int(item)}).fetchone()
+            return [int(row[0])] if row else []
+        # name lookup
+        rows = conn.execute(text("""
+            SELECT TrackId FROM Track WHERE lower(Name) LIKE :q ORDER BY TrackId
+        """), {"q": f"%{item.lower()}%"}).fetchall()
+        return [int(r[0]) for r in rows]
+
+    if kind == "album":
+        # id or title
+        if _is_int(item):
+            aid = int(item)
+        else:
+            row = conn.execute(text("""
+                SELECT AlbumId FROM Album WHERE lower(Title) LIKE :q ORDER BY AlbumId LIMIT 1
+            """), {"q": f"%{item.lower()}%"}).fetchone()
+            aid = int(row[0]) if row else None
+        if not aid:
+            return []
+        rows = conn.execute(text("SELECT TrackId FROM Track WHERE AlbumId=:aid ORDER BY TrackId"), {"aid": aid}).fetchall()
+        return [int(r[0]) for r in rows]
+
+    return []
+
+
+@tool
+def purchase_item(kind: str, item: str, quantity: int = 1):
+    """
+    Protected/Write: Create a NEW Invoice for the authed customer and add InvoiceLine(s).
+    Arguments:
+      - kind: "track" | "song" | "album"
+      - item: track id or name; OR album id or title
+      - quantity (optional): per-track quantity (default 1). For albums, applies to every track.
+    Returns: {invoice_id, total, lines:[{track_id, track_name, unit_price, quantity, line_total}], invoice_date, billing:{...}}
+    """
+    st = get_state()
+    customer_id = st.get("customer_id")
+    scope_error = enforce_customer_scope(customer_id)
+    if scope_error:
+        return scope_error
+
+    try:
+        q = int(quantity)
+        if q <= 0:
+            return {"error":"INVALID_INPUT", "message":"quantity must be > 0"}
+    except Exception:
+        return {"error":"INVALID_INPUT", "message":"quantity must be an integer"}
+
+    now_iso = datetime.utcnow().isoformat(timespec="seconds")
+    with engine.begin() as conn:
+        # resolve tracks
+        track_ids = _resolve_track_ids(conn, kind, item)
+        if not track_ids:
+            return {"error":"NOT_FOUND", "message": f"No tracks resolved for kind='{kind}' item='{item}'."}
+
+        # customer billing for invoice
+        cust = conn.execute(text("""
+            SELECT FirstName, LastName, Address, City, State, Country, PostalCode
+            FROM Customer WHERE CustomerId=:cid
+        """), {"cid": customer_id}).fetchone()
+        if not cust:
+            return {"error":"NO_CUSTOMER", "message":"Customer not found."}
+
+        # fetch prices & names
+        rows = conn.execute(text(f"""
+            SELECT TrackId, UnitPrice, Name FROM Track
+            WHERE TrackId IN ({",".join([str(t) for t in track_ids])})
+        """)).fetchall()
+        price = {int(r[0]): float(r[1]) for r in rows}
+        name  = {int(r[0]): r[2] for r in rows}
+        missing = [t for t in track_ids if t not in price]
+        if missing:
+            return {"error":"PRICE_MISSING", "message": f"Missing tracks: {missing}"}
+
+        # compute total + insert invoice
+        lines: List[Dict[str, Any]] = []
+        total = 0.0
+        for tid in track_ids:
+            unit = price[tid]; line_total = unit * q
+            total += line_total
+            lines.append({
+                "track_id": tid,
+                "track_name": name[tid],
+                "unit_price": unit,
+                "quantity": q,
+                "line_total": round(line_total, 2),
+            })
+
+        inv = conn.execute(text("""
+            INSERT INTO Invoice (
+                CustomerId, InvoiceDate,
+                BillingAddress, BillingCity, BillingState, BillingCountry, BillingPostalCode,
+                Total
+            )
+            VALUES (:cid, :dt, :addr, :city, :state, :country, :postal, :total)
+        """), {
+            "cid": customer_id, "dt": now_iso,
+            "addr": cust[2], "city": cust[3], "state": cust[4], "country": cust[5], "postal": cust[6],
+            "total": round(total, 2)
+        })
+        invoice_id = int(inv.lastrowid)
+
+        # insert lines
+        for L in lines:
+            conn.execute(text("""
+                INSERT INTO InvoiceLine (InvoiceId, TrackId, UnitPrice, Quantity)
+                VALUES (:iid, :tid, :price, :qty)
+            """), {"iid": invoice_id, "tid": L["track_id"], "price": L["unit_price"], "qty": L["quantity"]})
+
+    return {
+        "invoice_id": invoice_id,
+        "total": round(total, 2),
+        "lines": lines,
+        "invoice_date": now_iso,
+        "billing": {"address": cust[2], "city": cust[3], "state": cust[4], "country": cust[5], "postal": cust[6]},
+    }
+
+
+@tool
+def refund_invoice(invoice_id: int, mode: str = "full", lines: Optional[List[Dict[str, int]]] = None):
+    """
+    Protected/Write: Append negative-quantity InvoiceLine(s) to an existing Invoice.
+    Arguments:
+      - invoice_id: the Invoice to refund (must belong to authed customer)
+      - mode: "full" (default) or "partial"
+      - lines (required if partial): list of {"invoice_line_id": int, "qty": int} to refund
+    Behavior:
+      - FULL: adds a negative line for each original line (same UnitPrice, Quantity * -1) and reduces Invoice.Total.
+      - PARTIAL: for each provided line, adds a negative line with that qty; reduces Invoice.Total accordingly.
+    Returns: {invoice_id, amount, mode, added_lines:[{orig_line_id, track_id, unit_price, quantity, refunded_amount}], new_invoice_total}
+    """
+    st = get_state()
+    customer_id = st.get("customer_id")
+    scope_error = enforce_customer_scope(customer_id)
+    if scope_error:
+        return scope_error
+
+    mode = (mode or "full").lower()
+    if mode not in {"full", "partial"}:
+        return {"error":"INVALID_INPUT", "message":"mode must be 'full' or 'partial'."}
+    if mode == "partial":
+        if not isinstance(lines, list) or not lines:
+            return {"error":"INVALID_INPUT", "message":"Provide 'lines' for partial refunds."}
+
+    with engine.begin() as conn:
+        inv = conn.execute(text("""
+            SELECT InvoiceId, CustomerId, Total FROM Invoice WHERE InvoiceId=:iid
+        """), {"iid": invoice_id}).fetchone()
+        if not inv or int(inv[1]) != int(customer_id):
+            return {"error":"FORBIDDEN", "message":"Invoice not found for this customer."}
+
+        # map original lines
+        orig = conn.execute(text("""
+            SELECT InvoiceLineId, TrackId, UnitPrice, Quantity
+            FROM InvoiceLine WHERE InvoiceId=:iid
+        """), {"iid": invoice_id}).fetchall()
+        orig_map = {int(r[0]): {"track_id": int(r[1]), "unit_price": float(r[2]), "quantity": int(r[3])} for r in orig}
+        if mode == "full" and not orig_map:
+            return {"error":"NO_LINES", "message":"Invoice has no lines to refund."}
+
+        added = []
+        refund_amount = 0.0
+
+        if mode == "full":
+            to_refund = [{ "invoice_line_id": lid, "qty": data["quantity"] } for lid, data in orig_map.items()]
+        else:
+            to_refund = lines
+
+        for item in to_refund:
+            lid = int(item["invoice_line_id"])
+            qty = int(item["qty"])
+            if lid not in orig_map:
+                return {"error":"INVALID_LINE", "message": f"InvoiceLineId {lid} not in invoice."}
+            if qty <= 0 or qty > orig_map[lid]["quantity"]:
+                return {"error":"INVALID_QTY", "message": f"qty {qty} invalid for line {lid} (max {orig_map[lid]['quantity']})."}
+
+            track_id   = orig_map[lid]["track_id"]
+            unit_price = orig_map[lid]["unit_price"]
+            # negative quantity line
+            conn.execute(text("""
+                INSERT INTO InvoiceLine (InvoiceId, TrackId, UnitPrice, Quantity)
+                VALUES (:iid, :tid, :price, :negqty)
+            """), {"iid": invoice_id, "tid": track_id, "price": unit_price, "negqty": -qty})
+
+            refunded_amount = unit_price * qty
+            refund_amount += refunded_amount
+            added.append({
+                "orig_line_id": lid,
+                "track_id": track_id,
+                "unit_price": unit_price,
+                "quantity": -qty,
+                "refunded_amount": round(refunded_amount, 2),
+            })
+
+        # reduce invoice total
+        new_total = round(float(inv[2]) - refund_amount, 2)
+        conn.execute(text("UPDATE Invoice SET Total=:tot WHERE InvoiceId=:iid"),
+                     {"tot": new_total, "iid": invoice_id})
+
+    return {
+        "invoice_id": int(invoice_id),
+        "amount": round(refund_amount, 2),
+        "mode": mode,
+        "added_lines": added,
+        "new_invoice_total": new_total,
+    }
+
+AUTH_REQUIRED_TOOLS = {"get_customer_info", "get_past_purchases", "purchase_item", "refund_invoice"}
+WRITE_ACCESS_TOOLS = {"purchase_item", "refund_invoice"}
 
 # ---------------- Prompts ----------------
 customer_prompt = """You help users access or update account data. 
@@ -279,7 +476,8 @@ song_prompt = """You are the Music agent.
 
 Your goal: recommend music.
 - Offer personalized reccommendations when relevant. If the user explicitly asks for personalized recommendations OR agrees to them, call the protected tool `get_past_purchases` (the system will handle authentication). DO NOT ask for email or customer ID.
-- If the user does NOT ask for personalization (or declines), provide generic recommendations using public tools (`get_albums_by_artist`, `get_tracks_by_artist`, `check_for_songs`), or a brief clarifying question about taste (genres/artists/moods) if needed.
+- If the user does NOT ask for personalization (or declines), provide recommendations for music we have at this store by using public tools (`get_albums_by_artist`, `get_tracks_by_artist`, `check_for_songs`), or a brief clarifying question about taste (genres/artists/moods) if needed.
+- Prioritize recommendations that are in the store's catalog from the public tools.
 - You may ask a single, quick opt-in question like: "Want personalized picks based on your past purchases?" If the user says yes, call `get_past_purchases`. If no, proceed generically.
 - If you are already authenticated and the `customer_id` is known, pass that `customer_id` when calling protected tools.
 - Never ask for authentication details (email, ID). The system will handle that.
@@ -329,7 +527,8 @@ public_tools = [
     check_for_songs,
     authenticate_customer,
 ]
-auth_required_tools = [get_customer_info,  get_past_purchases]
+auth_required_tools = [get_customer_info,  get_past_purchases, purchase_item, refund_invoice]
+write_access_tools = [purchase_item, refund_invoice]
 
 def handle_tool_error(state) -> dict:
     error = state.get("error")
@@ -513,6 +712,8 @@ def route_from_music(state: State):
     last = state["messages"][-1]
     if _is_tool_call(last):
         names = _tool_names(last)
+        if any(n in WRITE_ACCESS_TOOLS for n in names):
+            return "write_access_tools"
         if any(n in AUTH_REQUIRED_TOOLS for n in names):
             return "ensure_auth" if not state.get("is_authed", False) else "auth_required_tools"
         return "public_tools"
@@ -523,6 +724,8 @@ def route_from_customer(state: State):
     last = state["messages"][-1]
     if _is_tool_call(last):
         names = _tool_names(last)
+        if any(n in WRITE_ACCESS_TOOLS for n in names):
+            return "write_access_tools"
         if any(n in AUTH_REQUIRED_TOOLS for n in names):
             return "ensure_auth" if not state.get("is_authed", False) else "auth_required_tools"
         return "public_tools"
@@ -549,6 +752,7 @@ def create_graph():
     g.add_node("customer", customer_node)
     g.add_node("public_tools", create_tool_node_with_fallback(public_tools))
     g.add_node("auth_required_tools", create_scoped_tool_node(auth_required_tools))
+    g.add_node("write_access_tools", create_scoped_tool_node(write_access_tools))
     g.add_node("ensure_auth", ensure_auth_node)
 
     g.add_edge(START, "init")
@@ -558,19 +762,21 @@ def create_graph():
     })
     g.add_conditional_edges("music", route_from_music, {
         END: END, "public_tools":"public_tools",
-        "ensure_auth":"ensure_auth", "auth_required_tools":"auth_required_tools", "supervisor": "supervisor"
+        "ensure_auth":"ensure_auth", "auth_required_tools":"auth_required_tools", "write_access_tools":"write_access_tools", "supervisor": "supervisor"
     })
     g.add_conditional_edges("customer", route_from_customer, {
         END: END, "public_tools":"public_tools",
-        "ensure_auth":"ensure_auth", "auth_required_tools":"auth_required_tools",  "supervisor": "supervisor"
+        "ensure_auth":"ensure_auth", "auth_required_tools":"auth_required_tools", "write_access_tools":"write_access_tools", "supervisor": "supervisor"
     })
     # After any tools finish, decide where to go:
     g.add_conditional_edges("public_tools", route_from_tools,
         {"music":"music","customer":"customer","supervisor":"supervisor"})
     g.add_conditional_edges("auth_required_tools", route_from_tools,
         {"music":"music","customer":"customer","supervisor":"supervisor"})
-    g.add_conditional_edges("ensure_auth", route_from_supervisor,  # will use resume/decision
+    g.add_conditional_edges("write_access_tools", route_from_tools,
+        {"music":"music","customer":"customer","supervisor":"supervisor"})
+    g.add_conditional_edges("ensure_auth", route_from_supervisor, 
         {"supervisor":"supervisor","music":"music","customer":"customer"})
     return g
 
-agent = create_graph().compile()
+agent = create_graph().compile(interrupt_before=["write_access_tools"])
