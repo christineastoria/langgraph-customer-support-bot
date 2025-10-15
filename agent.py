@@ -185,6 +185,37 @@ def check_for_songs(song_title: str):
     )
 
 @tool
+def get_top_genres_for_customer(customer_id: int, limit: int = 5):
+    """
+    Protected: Return the customer's most-purchased genres ranked by total quantity,
+    with tie-breakers on distinct tracks purchased.
+    Returns: {"columns": [...], "rows": [[...], ...]}
+    """
+    scope_error = enforce_customer_scope(customer_id)
+    if scope_error:
+        return scope_error
+
+    sql = text("""
+        SELECT
+            g.GenreId,
+            g.Name AS Genre,
+            SUM(il.Quantity) AS TotalQuantity,
+            COUNT(DISTINCT il.TrackId) AS DistinctTracks
+        FROM Invoice i
+        JOIN InvoiceLine il ON il.InvoiceId = i.InvoiceId
+        JOIN Track t ON t.TrackId = il.TrackId
+        LEFT JOIN Genre g ON g.GenreId = t.GenreId
+        WHERE i.CustomerId = :cid
+        GROUP BY g.GenreId, g.Name
+        ORDER BY TotalQuantity DESC, DistinctTracks DESC, g.Name ASC
+        LIMIT :lim
+    """)
+    with engine.connect() as conn:
+        rows = conn.execute(sql, {"cid": customer_id, "lim": limit}).fetchall()
+    columns = ["GenreId", "Genre", "TotalQuantity", "DistinctTracks"]
+    return {"columns": columns, "rows": [list(r) for r in rows]}
+
+@tool
 def authenticate_customer(customer_id: int, email: str):
     """Authenticate: verify email matches record for given customer."""
     try:
