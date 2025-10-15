@@ -278,9 +278,7 @@ Do NOT ask for authentication directly; the system handles that automatically.
 song_prompt = """You are the Music agent.
 
 Your goal: recommend music.
-
-Decision policy:
-- If the user explicitly asks for personalized recommendations OR agrees to them, call the protected tool `get_past_purchases` (the system will handle authentication). DO NOT ask for email or customer ID.
+- Offer personalized reccommendations when relevant. If the user explicitly asks for personalized recommendations OR agrees to them, call the protected tool `get_past_purchases` (the system will handle authentication). DO NOT ask for email or customer ID.
 - If the user does NOT ask for personalization (or declines), provide generic recommendations using public tools (`get_albums_by_artist`, `get_tracks_by_artist`, `check_for_songs`), or a brief clarifying question about taste (genres/artists/moods) if needed.
 - You may ask a single, quick opt-in question like: "Want personalized picks based on your past purchases?" If the user says yes, call `get_past_purchases`. If no, proceed generically.
 - If you are already authenticated and the `customer_id` is known, pass that `customer_id` when calling protected tools.
@@ -396,16 +394,12 @@ def supervisor_node(state: State):
 
 def music_node(state: State):
     msgs = state["messages"] + [focus_system_for("music", state)]
-    ai = model.bind_tools([
-        get_albums_by_artist, get_tracks_by_artist, check_for_songs, get_past_purchases
-    ]).invoke(msgs)
+    ai = song_chain.invoke(msgs)
     return {"messages": [add_name(ai, "music")]}
 
 def customer_node(state: State):
     msgs = state["messages"] + [focus_system_for("customer", state)]
-    ai = model.bind_tools([
-        get_customer_info, authenticate_customer, get_past_purchases
-    ]).invoke(msgs)
+    ai = customer_chain.invoke(msgs)
     return {"messages": [add_name(ai, "customer")]}
 
 
