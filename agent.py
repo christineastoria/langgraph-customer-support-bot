@@ -204,28 +204,33 @@ def _is_tool_call(msg):
     return hasattr(msg, "additional_kwargs") and "tool_calls" in msg.additional_kwargs
 
 # ---------------- Tool wrappers ----------------
-def _make_tools_runner(tools):
-    node = ToolNode(tools)
-    def run(state: State):
-        msgs = state.get("messages", [])
-        try:
-            out = node.invoke(msgs)
-            return {"messages": out}
-        except Exception as e:
-            tool_calls = []
-            last = msgs[-1] if msgs else None
-            if isinstance(last, AIMessage):
-                tool_calls = last.additional_kwargs.get("tool_calls", [])
-            return {"messages": [ToolMessage(content=f"Error: {e}", tool_call_id=tc["id"]) for tc in tool_calls]}
-    return RunnableLambda(run)
 
-_public_tools = _make_tools_runner([
+public_tools = [
     get_albums_by_artist,
     get_tracks_by_artist,
     check_for_songs,
     authenticate_customer,
-])
-_auth_required_tools = _make_tools_runner([get_customer_info,  get_past_purchases])
+]
+auth_required_tools = [get_customer_info,  get_past_purchases]
+
+def handle_tool_error(state) -> dict:
+    error = state.get("error")
+    tool_calls = state["messages"][-1].tool_calls
+    return {
+        "messages": [
+            ToolMessage(
+                content=f"Error: {repr(error)}\n please fix your mistakes.",
+                tool_call_id=tc["id"],
+            )
+            for tc in tool_calls
+        ]
+    }
+
+def create_tool_node_with_fallback(tools: list) -> dict:
+    return ToolNode(tools).with_fallbacks(
+        [RunnableLambda(handle_tool_error)], exception_key="error"
+    )
+
 
 # ---------------- Nodes ----------------
 def init_node(state: State):
@@ -256,9 +261,6 @@ def music_node(state: State):
 def customer_node(state: State):
     ai = customer_chain.invoke(state["messages"])
     return {"messages": [add_name(ai, "customer")]}
-
-def public_tools_node(state: State): return _public_tools.invoke(state)
-def auth_required_tools_node(state: State): return _auth_required_tools.invoke(state)
 
 def ensure_auth_node(state: State):
     msgs = state["messages"]
@@ -292,7 +294,7 @@ def ensure_auth_node(state: State):
         name="auth_request",
     )
     convo = msgs + [reply, auth_ai]
-    auth_res = _public_tools.invoke({**state, "messages": convo})["messages"]
+    auth_res = create_tool_node_with_fallback(public_tools).invoke({**state, "messages": convo})["messages"]
     ok, cust = False, None
     for m in reversed(auth_res):
         if getattr(m, "name", None) == "authenticate_customer":
@@ -341,8 +343,8 @@ def create_graph():
     g.add_node("router_ack", router_ack_node)
     g.add_node("music", music_node)
     g.add_node("customer", customer_node)
-    g.add_node("public_tools", public_tools_node)
-    g.add_node("auth_required_tools", auth_required_tools_node)
+    g.add_node("public_tools", create_tool_node_with_fallback(public_tools))
+    g.add_node("auth_required_tools", create_tool_node_with_fallback(auth_required_tools))
     g.add_node("ensure_auth", ensure_auth_node)
 
     nodes = {
