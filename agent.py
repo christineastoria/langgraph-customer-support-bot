@@ -13,10 +13,12 @@ from langgraph.graph.message import AnyMessage, add_messages
 from langgraph.prebuilt import ToolNode
 from langchain_core.runnables import RunnableLambda
 from langgraph.types import interrupt
+from contextvars import ContextVar
 
 # ---------------- Environment / Model ----------------
 load_dotenv()
 model = ChatOpenAI(temperature=0, streaming=True, model="gpt-4o")
+graph_state_ctx: ContextVar[dict] = ContextVar("graph_state_ctx", default={})
 
 # ---------------- State ----------------
 class State(TypedDict):
@@ -40,10 +42,48 @@ def get_engine_for_chinook_db():
 engine = get_engine_for_chinook_db()
 db = SQLDatabase(engine)
 
+# ---------------- Helpers ----------------
+def add_name(msg, name):
+    d = msg.model_dump()
+    d["name"] = name
+    return AIMessage(**d)
+
+def _is_tool_call(msg):
+    return hasattr(msg, "additional_kwargs") and "tool_calls" in msg.additional_kwargs
+
+def enforce_customer_scope(customer_id: Optional[int]) -> Optional[dict]:
+    st = graph_state_ctx.get({})
+    if not st.get("is_authed"):
+        return {"error": "AUTH_REQUIRED", "message": "Authenticate first."}
+
+    authed_id = st.get("customer_id")
+    if authed_id is None:
+        return {"error": "AUTH_REQUIRED", "message": "No authenticated customer_id in state."}
+
+    try:
+        req_id = int(customer_id) if customer_id is not None else None
+        authed_id = int(authed_id)
+    except Exception:
+        return {"error": "FORBIDDEN", "message": f"Invalid customer_id. Use authenticated customer_id={authed_id}."}
+
+    if req_id is None:
+        # You can choose to inject here instead; since this is inside the tool,
+        # safest is to force caller to pass correct id explicitly.
+        return {"error": "FORBIDDEN", "message": f"Missing customer_id. Use authenticated customer_id={authed_id}."}
+
+    if req_id != authed_id:
+        return {"error": "FORBIDDEN", "message": f"Cross-customer access denied. Use authenticated customer_id={authed_id}."}
+
+    return None 
+
+
 # ---------------- Tools ----------------
 @tool
 def get_customer_info(customer_id: int):
     """auth_required: look up a customer row by CustomerID (requires auth)."""
+    scope_error = enforce_customer_scope(customer_id)
+    if scope_error:
+        return scope_error
     return db.run(f"SELECT * FROM Customer WHERE CustomerID = {customer_id};")
 
 @tool
@@ -57,6 +97,9 @@ def get_past_purchases(
     Results are ordered by invoice date (desc by default) and limited.
     Returns: {"columns": [...], "rows": [[...], ...]}
     """
+    scope_error = enforce_customer_scope(customer_id)
+    if scope_error:
+        return scope_error
     try:
         order = "DESC" if recent_first else "ASC"
         sql = text(f"""
@@ -194,14 +237,6 @@ song_chain = with_song | model.bind_tools([
 ])
 route_chain = with_system | model.bind_tools([Router])
 
-# ---------------- Helpers ----------------
-def add_name(msg, name):
-    d = msg.model_dump()
-    d["name"] = name
-    return AIMessage(**d)
-
-def _is_tool_call(msg):
-    return hasattr(msg, "additional_kwargs") and "tool_calls" in msg.additional_kwargs
 
 # ---------------- Tool wrappers ----------------
 
@@ -231,6 +266,20 @@ def create_tool_node_with_fallback(tools: list) -> dict:
         [RunnableLambda(handle_tool_error)], exception_key="error"
     )
 
+def create_scoped_tool_node(tools: list):
+    base = ToolNode(tools).with_fallbacks(
+        [RunnableLambda(handle_tool_error)], exception_key="error"
+    )
+
+    def run_with_state(state):
+        token = graph_state_ctx.set(state)  # <-- expose state to tools
+        try:
+            return base.invoke(state)
+        finally:
+            graph_state_ctx.reset(token)
+
+    return RunnableLambda(run_with_state)
+
 
 # ---------------- Nodes ----------------
 def init_node(state: State):
@@ -240,20 +289,6 @@ def supervisor_node(state: State):
     ai = route_chain.invoke(state["messages"])
     return {"messages": [add_name(ai, "supervisor")]}
 
-def router_ack_node(state: State):
-    """Send ToolMessages acknowledging supervisor tool_calls before routing."""
-    msgs = state.get("messages", [])
-    last_ai = next((m for m in reversed(msgs) if isinstance(m, AIMessage)), None)
-    if not last_ai:
-        return {"messages": []}
-    tcs = last_ai.additional_kwargs.get("tool_calls", [])
-    if not tcs:
-        return {"messages": []}
-    return {"messages": [
-        ToolMessage(name=tc["function"]["name"], tool_call_id=tc["id"], content="ack")
-        for tc in tcs
-    ]}
-
 def music_node(state: State):
     ai = song_chain.invoke(state["messages"])
     return {"messages": [add_name(ai, "music")]}
@@ -262,24 +297,42 @@ def customer_node(state: State):
     ai = customer_chain.invoke(state["messages"])
     return {"messages": [add_name(ai, "customer")]}
 
+
 def ensure_auth_node(state: State):
-    msgs = state["messages"]
-    last_ai = next((m for m in reversed(msgs) if isinstance(m, AIMessage)), None)
-    if not last_ai:
+    """
+    If the last AI message requested a protected tool, pause to collect credentials,
+    call `authenticate_customer`, and return the auth result. 
+    """
+    history = state["messages"]
+
+    # Find the most recent AI message (from a sub-agent) that may have asked for a tool.
+    last_ai_msg = next((m for m in reversed(history) if isinstance(m, AIMessage)), None)
+    if not last_ai_msg:
         return {"messages": []}
-    tcs = last_ai.additional_kwargs.get("tool_calls", [])
-    tc = next((t for t in tcs if t["function"]["name"] in AUTH_REQUIRED_TOOLS), None)
-    if not tc:
+
+    # Identify whether the AI requested any protected tool (e.g., get_past_purchases).
+    tool_calls = last_ai_msg.additional_kwargs.get("tool_calls", [])
+    protected_call = next(
+        (tc for tc in tool_calls if tc["function"]["name"] in AUTH_REQUIRED_TOOLS),
+        None,
+    )
+    if not protected_call:
         return {"messages": []}
-    # reply first
-    reply = ToolMessage(
-        name=tc["function"]["name"],
-        tool_call_id=tc["id"],
+
+    # Tell the requesting tool it’s blocked on auth (good for traces / observability).
+    auth_gate_msg = ToolMessage(
+        name=protected_call["function"]["name"],
+        tool_call_id=protected_call["id"],
         content=json.dumps({"error": "AUTH_REQUIRED"}),
     )
-    cid = interrupt({"ask": "Enter your customer_id:", "field": "customer_id"})
+
+    # Just-in-time credential collection.
+    customer_id = interrupt({"ask": "Enter your customer_id:", "field": "customer_id"})
     email = interrupt({"ask": "Enter your email:", "field": "email"})
-    auth_ai = AIMessage(
+
+    # Create an AIMessage that calls the *specific* tool we need: authenticate_customer.
+    auth_call_ai = AIMessage(
+        name="auth_request",
         content="Authenticating...",
         additional_kwargs={
             "tool_calls": [{
@@ -287,25 +340,39 @@ def ensure_auth_node(state: State):
                 "type": "function",
                 "function": {
                     "name": "authenticate_customer",
-                    "arguments": json.dumps({"customer_id": cid, "email": email}),
+                    "arguments": json.dumps({"customer_id": customer_id, "email": email}),
                 },
             }]
         },
-        name="auth_request",
     )
-    convo = msgs + [reply, auth_ai]
-    auth_res = create_tool_node_with_fallback(public_tools).invoke({**state, "messages": convo})["messages"]
-    ok, cust = False, None
-    for m in reversed(auth_res):
-        if getattr(m, "name", None) == "authenticate_customer":
-            data = m.content
-            if isinstance(data, str):
-                try: data = json.loads(data)
-                except: data = {}
-            ok = data.get("success", False)
-            cust = data.get("customer_id")
+
+    # Execute only `authenticate_customer`, with fallback error handling.
+    auth_runner = create_tool_node_with_fallback([authenticate_customer])
+    exec_state = {**state, "messages": history + [auth_gate_msg, auth_call_ai]}
+    tool_outputs = auth_runner.invoke(exec_state)["messages"]
+
+    # Parse the tool's response to determine auth status.
+    auth_success = False
+    authed_customer_id: Optional[int] = None
+    for msg in reversed(tool_outputs):
+        if getattr(msg, "name", None) == "authenticate_customer":
+            payload = msg.content
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload)
+                except Exception:
+                    payload = {}
+            auth_success = bool(payload.get("success"))
+            authed_customer_id = payload.get("customer_id")
             break
-    return {"messages": [reply, auth_ai] + auth_res, "is_authed": ok, "customer_id": cust}
+
+    # Return all messages we emitted plus auth flags in state.
+    return {
+        "messages": [auth_gate_msg, auth_call_ai] + tool_outputs,
+        "is_authed": auth_success,
+        "customer_id": authed_customer_id,
+    }
+
 
 # ---------------- Routing ----------------
 def _route(state: State):
@@ -314,7 +381,19 @@ def _route(state: State):
     last = msgs[-1]
     if isinstance(last, AIMessage):
         if last.name == "supervisor":
-            if _is_tool_call(last): return "router_ack"
+            if _is_tool_call(last):
+                # Read the Router tool's arguments and jump directly
+                tcs = last.additional_kwargs.get("tool_calls", [])
+                if tcs:
+                    try:
+                        choice = json.loads(tcs[0]["function"].get("arguments") or "{}").get("choice")
+                    except Exception:
+                        choice = None
+                    if choice in {"music", "customer"}:
+                        return choice
+                # If malformed, bounce back to supervisor to re-pick
+                return "supervisor"
+            #No tool call from supervisor → end this turn
             return END
         if last.name in {"customer", "music"}:
             if _is_tool_call(last):
@@ -340,16 +419,14 @@ def create_graph():
     g = StateGraph(State)
     g.add_node("init", init_node)
     g.add_node("supervisor", supervisor_node)
-    g.add_node("router_ack", router_ack_node)
     g.add_node("music", music_node)
     g.add_node("customer", customer_node)
     g.add_node("public_tools", create_tool_node_with_fallback(public_tools))
-    g.add_node("auth_required_tools", create_tool_node_with_fallback(auth_required_tools))
+    g.add_node("auth_required_tools", create_scoped_tool_node(auth_required_tools))
     g.add_node("ensure_auth", ensure_auth_node)
 
     nodes = {
         "supervisor": "supervisor",
-        "router_ack": "router_ack",
         "music": "music",
         "customer": "customer",
         "public_tools": "public_tools",
@@ -361,7 +438,6 @@ def create_graph():
     g.add_edge(START, "init")
     g.add_edge("init", "supervisor")
     g.add_conditional_edges("supervisor", _route, nodes)
-    g.add_conditional_edges("router_ack", _route, nodes)
     g.add_conditional_edges("music", _route, nodes)
     g.add_conditional_edges("customer", _route, nodes)
     g.add_edge("public_tools", "supervisor")
