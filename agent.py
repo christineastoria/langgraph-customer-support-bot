@@ -216,6 +216,7 @@ Decision policy:
 - If you are already authenticated and the `customer_id` is known, pass that `customer_id` when calling protected tools.
 - Never ask for authentication details (email, ID). The system will handle that."""
 
+#TODO: make this a prompt template with outputs required from pydantic
 system_prompt = """You are a supervisor who routes between agents:
 - For music: route 'music'
 - For customer/account tasks: route 'customer'"""
@@ -272,7 +273,7 @@ def create_scoped_tool_node(tools: list):
     )
 
     def run_with_state(state):
-        token = graph_state_ctx.set(state)  # <-- expose state to tools
+        token = graph_state_ctx.set(state)  
         try:
             return base.invoke(state)
         finally:
@@ -382,7 +383,6 @@ def _route(state: State):
     if isinstance(last, AIMessage):
         if last.name == "supervisor":
             if _is_tool_call(last):
-                # Read the Router tool's arguments and jump directly
                 tcs = last.additional_kwargs.get("tool_calls", [])
                 if tcs:
                     try:
@@ -393,7 +393,6 @@ def _route(state: State):
                         return choice
                 # If malformed, bounce back to supervisor to re-pick
                 return "supervisor"
-            #No tool call from supervisor → end this turn
             return END
         if last.name in {"customer", "music"}:
             if _is_tool_call(last):
@@ -401,8 +400,9 @@ def _route(state: State):
                 if any(tc["function"]["name"] in AUTH_REQUIRED_TOOLS for tc in tcs):
                     return "ensure_auth" if not state.get("is_authed", False) else "auth_required_tools"
                 return "public_tools"
-            return "supervisor"
+            return END #TODO should we loop back to supervisor instead? need to figure out when to end vs return to supervisor
     if isinstance(last, ToolMessage):
+        #route back to the appropriate sub-agent based on the last sub-agent that made a tool call
         prev_ai = next((m for m in reversed(msgs[:-1]) if isinstance(m, AIMessage)), None)
         if prev_ai and prev_ai.name == "supervisor" and _is_tool_call(prev_ai):
             tcs = prev_ai.additional_kwargs.get("tool_calls", [])
@@ -410,7 +410,7 @@ def _route(state: State):
                 try:
                     choice = json.loads(tcs[0]["function"].get("arguments")).get("choice")
                 except: choice = None
-                if choice in {"music", "customer"}: return choice
+                if choice in {"music", "customer"}: return choice 
         return "supervisor"
     return "supervisor"
 
