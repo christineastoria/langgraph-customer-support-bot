@@ -252,9 +252,9 @@ Decision policy:
 - Never ask for authentication details (email, ID). The system will handle that."""
 
 #TODO: make this a prompt template with outputs required from a pydantic model
-system_prompt = """You are a supervisor who routes between agents:
-- For music: route 'music'
-- For customer/account tasks: route 'customer'"""
+system_prompt = """You are a supervisor of a music store who routes between agents:
+- For music or any personalized music recommendations: route 'music'
+- For other customer/account tasks: route 'customer'"""
 
 
 def with_system(msgs): return [SystemMessage(content=system_prompt)] + msgs
