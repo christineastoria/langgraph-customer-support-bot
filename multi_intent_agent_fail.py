@@ -16,7 +16,6 @@ from langgraph.types import interrupt
 from typing_extensions import Literal
 from contextvars import ContextVar
 from langgraph.prebuilt import tools_condition
-from langchain_core.messages import HumanMessage, SystemMessage, BaseMessage
 
 # ---------------- Environment / Model ----------------
 load_dotenv()
@@ -80,37 +79,6 @@ def enforce_customer_scope(customer_id: Optional[int]) -> Optional[dict]:
         return {"error": "FORBIDDEN", "message": f"Cross-customer access denied. Use authenticated customer_id={authed_id}."}
 
     return None 
-
-def last_user_text(msgs: list[BaseMessage]) -> str:
-    for m in reversed(msgs):
-        if isinstance(m, HumanMessage):
-            return m.content if isinstance(m.content, str) else str(m.content)
-    return ""
-
-def focus_system_for(agent: str, state: State) -> SystemMessage:
-    latest = last_user_text(state["messages"])
-    remaining = list(state.get("pending_routes", []))  # after supervisor popped the current one
-    is_final = len(remaining) == 0
-
-    return SystemMessage(content=f"""
-        You are the **{agent}** agent in a multi-agent system. You can see the entire history for context.
-
-        Respond to the **latest user message** below from the {agent} domain.
-        Intents remaining after your reply: {remaining if remaining else "[]"}
-        {"You are the **final** responder for this user turn." if is_final else "You are **not** the final responder for this turn; another agent will reply next."}
-
-        CRITICAL RULES:
-        - Provide a concrete answer to the latest user message for your domain.
-        - Do **not** use generic closers (e.g., "let me/us know if anything else...").
-        - If tools are needed, call them; otherwise answer directly.
-        - Treat assistant messages as notes from other agents; do not assume the task is done unless **you** answered it.
-        - {("Since you are final, wrap cleanly with the needed information only.") if is_final else ("Since you are not final, avoid wrap-up/closing language; keep it concise so the next agent can continue.")}
-
-        Latest user message to address now:
-        ---
-        {latest}
-    ---
-    """)
 
 
 # ---------------- Tools ----------------
@@ -271,10 +239,7 @@ AUTH_REQUIRED_TOOLS = {"get_customer_info", "get_past_purchases"}
 
 # ---------------- Prompts ----------------
 customer_prompt = """You help users access or update account data. 
-Do NOT ask for authentication directly; the system handles that automatically.
-- Answer the **latest user message below** from the perspective of the customer domain.
-- You can treat any assistant messages as notes and help from other agents; do **not** assume the request is already resolved unless **you** have responded yourself.
-"""
+Do NOT ask for authentication directly; the system handles that automatically."""
 song_prompt = """You are the Music agent.
 
 Your goal: recommend music.
@@ -284,10 +249,7 @@ Decision policy:
 - If the user does NOT ask for personalization (or declines), provide generic recommendations using public tools (`get_albums_by_artist`, `get_tracks_by_artist`, `check_for_songs`), or a brief clarifying question about taste (genres/artists/moods) if needed.
 - You may ask a single, quick opt-in question like: "Want personalized picks based on your past purchases?" If the user says yes, call `get_past_purchases`. If no, proceed generically.
 - If you are already authenticated and the `customer_id` is known, pass that `customer_id` when calling protected tools.
-- Never ask for authentication details (email, ID). The system will handle that.
-- Answer the **latest user message below** from the perspective of the music domain.
-- You can treat any assistant messages as notes and help from other agents; do **not** assume the request is already resolved unless **you** have responded yourself.
-"""
+- Never ask for authentication details (email, ID). The system will handle that."""
 
 #TODO: make this a prompt template with outputs required from a pydantic model
 system_prompt = """You are a supervisor of a music store who routes between agents:
@@ -381,31 +343,24 @@ def init_node(state: State):
     }
 
 def supervisor_node(state: State):
-    # If there’s already a queue, don’t recompute; just keep it.
-    if state.get("pending_routes"):
-        return {"pending_routes": state["pending_routes"]}
-
-    decision = router.invoke([SystemMessage(content=system_prompt)] + state["messages"])
-    steps = decision.step if isinstance(decision.step, list) else [decision.step]
-    return {
-        "pending_routes": steps,
-        # optional visibility only:
-        # "__metadata__": {"supervisor_decision": steps},
-        # "messages": [AIMessage(content=f"(Supervisor decision: {steps})", name="supervisor")],
-    }
+    # Only run the router if we don't already have a queue
+    if not state.get("pending_routes"):
+        decision = router.invoke([SystemMessage(content=system_prompt)] + state["messages"])
+        steps = decision.step if isinstance(decision.step, list) else [decision.step]
+        return {
+            "pending_routes": steps,
+            "decision": steps,
+            "__metadata__": {"supervisor_decision": steps},
+        }
+    # nothing new to decide
+    return {"pending_routes": state["pending_routes"], "decision": state.get("decision", [])}
 
 def music_node(state: State):
-    msgs = state["messages"] + [focus_system_for("music", state)]
-    ai = model.bind_tools([
-        get_albums_by_artist, get_tracks_by_artist, check_for_songs, get_past_purchases
-    ]).invoke(msgs)
+    ai = song_chain.invoke(state["messages"])
     return {"messages": [add_name(ai, "music")]}
 
 def customer_node(state: State):
-    msgs = state["messages"] + [focus_system_for("customer", state)]
-    ai = model.bind_tools([
-        get_customer_info, authenticate_customer, get_past_purchases
-    ]).invoke(msgs)
+    ai = customer_chain.invoke(state["messages"])
     return {"messages": [add_name(ai, "customer")]}
 
 
