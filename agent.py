@@ -161,7 +161,6 @@ def get_past_purchases(
             LEFT JOIN Artist ar ON ar.ArtistId = a.ArtistId
             WHERE i.CustomerId = :cid
             ORDER BY i.InvoiceDate {order}, i.InvoiceId {order}, il.InvoiceLineId {order}
-            LIMIT :lim
         """)
         with engine.connect() as conn:
             rows = conn.execute(sql, {"cid": customer_id}).fetchall()
@@ -307,7 +306,7 @@ def purchase_item(kind: str, item: str, quantity: int = 1):
     now_iso = datetime.utcnow().isoformat(timespec="seconds")
     with engine.begin() as conn:
         # resolve tracks
-        track_ids = _resolve_track_ids(conn, kind, item)
+        track_ids = resolve_track_ids(conn, kind, item)
         if not track_ids:
             return {"error":"NOT_FOUND", "message": f"No tracks resolved for kind='{kind}' item='{item}'."}
 
@@ -471,6 +470,7 @@ customer_prompt = """You help users access or update account data.
 Do NOT ask for authentication directly; the system handles that automatically.
 - Answer the **latest user message below** from the perspective of the customer domain.
 - You can treat any assistant messages as notes and help from other agents; do **not** assume the request is already resolved unless **you** have responded yourself.
+- Use purchase_item or refund_invoice when the user explicitly requests a purchase or refund. Don't try to execute these actions yourself
 """
 song_prompt = """You are the Music agent.
 
@@ -511,7 +511,7 @@ def with_song_fn(msgs):
     return [SystemMessage(content=song_prompt)] + msgs
 
 customer_chain = RunnableLambda(with_customer_fn) | model.bind_tools([
-    get_customer_info, authenticate_customer, get_past_purchases
+    get_customer_info, authenticate_customer, get_past_purchases, purchase_item, refund_invoice
 ])
 
 song_chain = RunnableLambda(with_song_fn) | model.bind_tools([
@@ -712,10 +712,10 @@ def route_from_music(state: State):
     last = state["messages"][-1]
     if _is_tool_call(last):
         names = _tool_names(last)
-        if any(n in WRITE_ACCESS_TOOLS for n in names):
-            return "write_access_tools"
         if any(n in AUTH_REQUIRED_TOOLS for n in names):
             return "ensure_auth" if not state.get("is_authed", False) else "auth_required_tools"
+        if any(n in WRITE_ACCESS_TOOLS for n in names):
+            return "write_access_tools"
         return "public_tools"
     # No tool call → agent is “done for now”
     return "supervisor" if _has_pending(state) else END
@@ -724,10 +724,10 @@ def route_from_customer(state: State):
     last = state["messages"][-1]
     if _is_tool_call(last):
         names = _tool_names(last)
-        if any(n in WRITE_ACCESS_TOOLS for n in names):
-            return "write_access_tools"
         if any(n in AUTH_REQUIRED_TOOLS for n in names):
             return "ensure_auth" if not state.get("is_authed", False) else "auth_required_tools"
+        if any(n in WRITE_ACCESS_TOOLS for n in names):
+            return "write_access_tools"
         return "public_tools"
     return "supervisor" if _has_pending(state) else END
 
@@ -770,11 +770,11 @@ def create_graph():
     })
     # After any tools finish, decide where to go:
     g.add_conditional_edges("public_tools", route_from_tools,
-        {"music":"music","customer":"customer","supervisor":"supervisor"})
+        {"music":"music","customer":"customer"})
     g.add_conditional_edges("auth_required_tools", route_from_tools,
-        {"music":"music","customer":"customer","supervisor":"supervisor"})
+        {"music":"music","customer":"customer"})
     g.add_conditional_edges("write_access_tools", route_from_tools,
-        {"music":"music","customer":"customer","supervisor":"supervisor"})
+        {"music":"music","customer":"customer"})
     g.add_conditional_edges("ensure_auth", route_from_supervisor, 
         {"supervisor":"supervisor","music":"music","customer":"customer"})
     return g
