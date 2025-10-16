@@ -28,12 +28,15 @@ load_dotenv()
 #     "tags": ["llm"],
 #     "metadata": {"model": "gpt-4o"}
 # })
-model = ChatAnthropic(temperature=0, streaming=True, model="gpt-4o").with_config({
+model = ChatAnthropic(
+    temperature=0,
+    streaming=True,
+    model="claude-3-5-sonnet-latest"   # e.g., Anthropic model id
+).with_config({
     "run_name": "llm",
     "tags": ["llm"],
-    "metadata": {"model": "gpt-4o"}
+    "metadata": {"provider": "anthropic", "model": "claude-3-5-sonnet-latest"}
 })
-
 graph_state_ctx: ContextVar[dict] = ContextVar("graph_state_ctx", default={})
 
 # ---------------- State ----------------
@@ -546,23 +549,16 @@ def with_customer_fn(msgs):
 def with_song_fn(msgs): 
     return [SystemMessage(content=song_prompt)] + msgs
 
-customer_chain = RunnableLambda(with_customer_fn) | mmodel.bind_tools([
-    get_customer_info.with_config({"run_name":"tool:get_customer_info","tags":["tool:get_customer_info"]}),
-    authenticate_customer.with_config({"run_name":"tool:authenticate_customer","tags":["tool:authenticate_customer"]}),
-    get_past_purchases.with_config({"run_name":"tool:get_past_purchases","tags":["tool:get_past_purchases"]}),
-    purchase_item.with_config({"run_name":"tool:purchase_item","tags":["tool:purchase_item"]}),
-    refund_invoice.with_config({"run_name":"tool:refund_invoice","tags":["tool:refund_invoice"]}),
+customer_chain = RunnableLambda(with_customer_fn) | model.bind_tools([
+    get_customer_info, authenticate_customer, get_past_purchases, purchase_item, refund_invoice, 
 ]).with_config({
     "run_name": "agent:customer.llm",
     "tags": ["agent:customer", "llm"],
     "metadata": {"component": "agent_llm", "agent": "customer"}
 })
 
-song_chain = RunnableLambda(with_song_fn) | ([
-    get_albums_by_artist.with_config({"run_name":"tool:get_albums_by_artist","tags":["tool:get_albums_by_artist"]}),
-    get_tracks_by_artist.with_config({"run_name":"tool:get_tracks_by_artist","tags":["tool:get_tracks_by_artist"]}),
-    check_for_songs.with_config({"run_name":"tool:check_for_songs","tags":["tool:check_for_songs"]}),
-    get_past_purchases.with_config({"run_name":"tool:get_past_purchases","tags":["tool:get_past_purchases"]}),
+song_chain = RunnableLambda(with_song_fn) | model.bind_tools([
+    get_albums_by_artist, get_tracks_by_artist, check_for_songs, get_past_purchases
 ]).with_config({
     "run_name": "agent:music.llm",
     "tags": ["agent:music", "llm"],
