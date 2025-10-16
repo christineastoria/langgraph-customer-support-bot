@@ -31,11 +31,11 @@ load_dotenv()
 model = ChatAnthropic(
     temperature=0,
     streaming=True,
-    model="claude-3-5-sonnet-latest"   # e.g., Anthropic model id
+    model="claude-sonnet-4-5-20250929"   # e.g., Anthropic model id
 ).with_config({
     "run_name": "llm",
     "tags": ["llm"],
-    "metadata": {"provider": "anthropic", "model": "claude-3-5-sonnet-latest"}
+    "metadata": {"provider": "anthropic", "model": "claude-sonnet-4-5-20250929"}
 })
 graph_state_ctx: ContextVar[dict] = ContextVar("graph_state_ctx", default={})
 
@@ -639,12 +639,12 @@ def supervisor_node(state: State):
     }
 
 def music_node(state: State):
-    msgs = state["messages"] + [focus_system_for("music", state)]
+    msgs = [focus_system_for("music", state)] + state["messages"]
     ai = song_chain.invoke(msgs)
     return {"messages": [add_name(ai, "music")]}
 
 def customer_node(state: State):
-    msgs = state["messages"] + [focus_system_for("customer", state)]
+    msgs = [focus_system_for("customer", state)] + state["messages"]
     ai = customer_chain.invoke(msgs)
     return {"messages": [add_name(ai, "customer")]}
 
