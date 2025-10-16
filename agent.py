@@ -103,9 +103,10 @@ def focus_system_for(agent: str, state: State) -> SystemMessage:
 
         CRITICAL RULES:
         - Keep responses short to medium length and to the point.
-        - Provide a concrete answer to the latest user message for your domain.
-        - Do **not** use generic closers (e.g., "let me/us know if anything else...").
         - If tools are needed, call them; otherwise answer directly.
+        - You may call at most one tool per response. Choose the single most appropriate tool; do not call multiple at once
+        - Do not call the same tool more than once in a row with identical arguments; if you have the data, answer from it.
+        - Provide a concrete answer to the latest user message for your domain.
         - Treat assistant messages as notes from other agents; do not assume the task is done unless **you** answered it.
         - {("Since you are final, wrap cleanly with the needed information only.") if is_final else ("Since you are not final, avoid wrap-up/closing language; keep it concise so the next agent can continue.")}
 
@@ -187,20 +188,25 @@ def get_past_purchases(
         return {"error": f"Query failed: {e}"}
 
 
+
 @tool
 def get_albums_by_artist(artist: str):
     """Public: return albums for a given artist."""
-    return db.run(
+    result = db.run(
         f"""SELECT Album.Title, Artist.Name 
             FROM Album JOIN Artist ON Album.ArtistId = Artist.ArtistId 
             WHERE Artist.Name LIKE '%{artist}%';""",
         include_columns=True
     )
+    if not result or not result.get("rows"):
+        return {"error": "NO_RESULTS", "message": f"No artists found in the inventory matching '{artist}'."}
+    return result
+
 
 @tool
 def get_tracks_by_artist(artist: str):
     """Public: list tracks and artist for a LIKE-matched artist."""
-    return db.run(
+    result = db.run(
         f"""SELECT Track.Name as SongName, Artist.Name as ArtistName 
             FROM Album 
             LEFT JOIN Artist ON Album.ArtistId = Artist.ArtistId 
@@ -208,14 +214,22 @@ def get_tracks_by_artist(artist: str):
             WHERE Artist.Name LIKE '%{artist}%';""",
         include_columns=True
     )
+    if not result or not result.get("rows"):
+        return {"error": "NO_RESULTS", "message": f"No artists found in the inventory matching '{artist}'."}
+    return result
+
 
 @tool
 def check_for_songs(song_title: str):
     """Public: search tracks by title using a LIKE filter."""
-    return db.run(
+    result = db.run(
         f"""SELECT * FROM Track WHERE Name LIKE '%{song_title}%';""",
         include_columns=True
     )
+    if not result or not result.get("rows"):
+        return {"error": "NO_RESULTS", "message": f"No songs found in the inventory matching '{song_title}'."}
+    return result
+
 
 @tool
 def authenticate_customer(customer_id: int, email: str):
@@ -470,6 +484,7 @@ customer_prompt = """You help users access or update account data.
 Do NOT ask for authentication directly; the system handles that automatically.
 - Use get_customer_info to fetch customer personal details like address, email, name, etc. 
 - You can treat any assistant messages as notes and help from other agents; do **not** assume the request is already resolved unless **you** have responded yourself.
+- Do not execute a purchase or refund unless you the user has specified explicitly what item they want to purchase or refund. If they haven't, ask. 
 - Use purchase_item or refund_invoice when the user explicitly requests a purchase or refund. Don't try to execute these actions yourself
 """
 
@@ -478,7 +493,8 @@ song_prompt = """You are the Music agent.
 Your goal: recommend music for purchase.
 - Offer personalized reccommendations when relevant. If the user explicitly asks for personalized recommendations OR agrees to them, call the protected tool `get_past_purchases` (the system will handle authentication). DO NOT ask for email or customer ID.
 - If the user does NOT ask for personalization (or declines), provide recommendations for music we have at this store by using public tools (`get_albums_by_artist`, `get_tracks_by_artist`, `check_for_songs`), or a brief clarifying question about taste (genres/artists/moods) if needed.
-- Prioritize recommendations that are in the store's catalog from the public tools.
+- Prioritize recommendations that are in the store's catalog from the public tools when possible, but dont continue to search for artists that you find out aren't there.
+- If public tools return None, then those queried items aren't available in the store. 
 - If recommending, always ask if the user wants to purchase recommendations
 - You may ask a single, quick opt-in question like: "Want personalized picks based on your past purchases?" If the user says yes, call `get_past_purchases`. If no, proceed generically.
 - If you are already authenticated and the `customer_id` is known, pass that `customer_id` when calling protected tools.
@@ -491,7 +507,7 @@ Your goal: recommend music for purchase.
 system_prompt = """You are a supervisor of a music store who routes between agents:
 - For music or any personalized music recommendations: route ['music']
 - For other customer/account tasks: route ['customer']
-- Prioritize single routes, but if more than one applies, you can route both. Example: ['music', 'customer'] or ['customer', 'music']
+- Prioritize single routes, but if more than one applies, you can route both. Example: ['customer', 'music']. If more than one applies, put them in order of desired execution. 
 """
 
 
@@ -513,7 +529,7 @@ def with_song_fn(msgs):
     return [SystemMessage(content=song_prompt)] + msgs
 
 customer_chain = RunnableLambda(with_customer_fn) | model.bind_tools([
-    get_customer_info, authenticate_customer, get_past_purchases, purchase_item, refund_invoice
+    get_customer_info, authenticate_customer, get_past_purchases, purchase_item, refund_invoice, 
 ])
 
 song_chain = RunnableLambda(with_song_fn) | model.bind_tools([
