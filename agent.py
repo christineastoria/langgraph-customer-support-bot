@@ -23,20 +23,20 @@ from typing import Optional, List, Dict, Any
 
 # ---------------- Environment / Model ----------------
 load_dotenv()
-# model = ChatOpenAI(temperature=0, streaming=True, model="gpt-4o").with_config({
-#     "run_name": "llm",
-#     "tags": ["llm"],
-#     "metadata": {"model": "gpt-4o"}
-# })
-model = ChatAnthropic(
-    temperature=0,
-    streaming=True,
-    model="claude-sonnet-4-5-20250929"   # e.g., Anthropic model id
-).with_config({
+model = ChatOpenAI(temperature=0, streaming=True, model="gpt-4o").with_config({
     "run_name": "llm",
     "tags": ["llm"],
-    "metadata": {"provider": "anthropic", "model": "claude-sonnet-4-5-20250929"}
+    "metadata": {"model": "gpt-4o"}
 })
+# model = ChatAnthropic(
+#     temperature=0,
+#     streaming=True,
+#     model="claude-sonnet-4-5-20250929"   # e.g., Anthropic model id
+# ).with_config({
+#     "run_name": "llm",
+#     "tags": ["llm"],
+#     "metadata": {"provider": "anthropic", "model": "claude-sonnet-4-5-20250929"}
+# })
 graph_state_ctx: ContextVar[dict] = ContextVar("graph_state_ctx", default={})
 
 # ---------------- State ----------------
@@ -213,7 +213,7 @@ def get_albums_by_artist(artist: str):
             WHERE Artist.Name LIKE '%{artist}%';""",
         include_columns=True
     )
-    if not result or not result.get("rows"):
+    if result == "":
         return {"error": "NO_RESULTS", "message": f"No artists found in the inventory matching '{artist}'."}
     return result
 
@@ -229,7 +229,7 @@ def get_tracks_by_artist(artist: str):
             WHERE Artist.Name LIKE '%{artist}%';""",
         include_columns=True
     )
-    if not result or not result.get("rows"):
+    if result == "":
         return {"error": "NO_RESULTS", "message": f"No artists found in the inventory matching '{artist}'."}
     return result
 
@@ -241,7 +241,7 @@ def check_for_songs(song_title: str):
         f"""SELECT * FROM Track WHERE Name LIKE '%{song_title}%';""",
         include_columns=True
     )
-    if not result or not result.get("rows"):
+    if result == "":
         return {"error": "NO_RESULTS", "message": f"No songs found in the inventory matching '{song_title}'."}
     return result
 
@@ -639,12 +639,12 @@ def supervisor_node(state: State):
     }
 
 def music_node(state: State):
-    msgs = [focus_system_for("music", state)] + state["messages"]
+    msgs = state["messages"] + [focus_system_for("music", state)]
     ai = song_chain.invoke(msgs)
     return {"messages": [add_name(ai, "music")]}
 
 def customer_node(state: State):
-    msgs = [focus_system_for("customer", state)] + state["messages"]
+    msgs =  state["messages"] + [focus_system_for("customer", state)]
     ai = customer_chain.invoke(msgs)
     return {"messages": [add_name(ai, "customer")]}
 
