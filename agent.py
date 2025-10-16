@@ -570,21 +570,6 @@ def create_tool_node_with_fallback(tools: list) -> dict:
         [RunnableLambda(handle_tool_error)], exception_key="error"
     )
 
-# class ScopedToolNode(ToolNode):
-#     """ToolNode that automatically injects graph state into context var."""
-#     def invoke(self, state, config=None):
-#         token = graph_state_ctx.set(state)
-#         try:
-#             return super().invoke(state, config=config)
-#         finally:
-#             graph_state_ctx.reset(token)
-
-# def create_scoped_tool_node(tools: list):
-#     return ScopedToolNode(tools).with_fallbacks(
-#         [RunnableLambda(handle_tool_error)],
-#         exception_key="error",
-#     )
-
 def create_scoped_tool_node(tools: list):
     base = ToolNode(tools).with_fallbacks(
         [RunnableLambda(handle_tool_error)], exception_key="error"
@@ -749,12 +734,7 @@ def route_from_music(state: State):
         # Gate auth first if *any* requested tool needs it
         if any(n in AUTH_REQUIRED_TOOLS for n in names) and not state.get("is_authed", False):
             return "ensure_auth"
-
-        # #TODO remove this bc music agent shouldnt ever need write tools
-        # # Then prefer write node for writes (now authed)
-        # if any(n in WRITE_ACCESS_TOOLS for n in names):
-        #     return "write_access_tools"
-
+        
         # Otherwise protected read-only tools
         if any(n in AUTH_REQUIRED_TOOLS for n in names):
             return "auth_required_tools"
